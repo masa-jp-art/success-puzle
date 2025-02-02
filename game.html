@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>20250202-サクセス落ちゲー</title>
+  <style>
+    body {
+      background-color: #111;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-family: Arial, sans-serif;
+      color: #eee;
+    }
+    canvas {
+      background-color: #222;
+      border: 3px solid #555;
+      margin-top: 20px;
+    }
+    #scoreBoard {
+      margin-top: 10px;
+      font-size: 20px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas" width="480" height="480"></canvas>
+  <div id="scoreBoard"></div>
+  <script>
+    /* ===============================
+       定数および基本設定
+       =============================== */
+    const COLS = 12;               // 横12マス
+    const ROWS = 12;               // 縦12マス
+    const BLOCK_SIZE = 40;         // 1マス40px
+    const FALL_INTERVAL = 500;     // 落下間隔(ms)
+    const BLOCK_TYPES = ["サ", "ク", "セ", "ス"]; // ブロック文字の種類
+
+    // ブロック文字ごとの色（視認性を高める）
+    function getBlockColor(letter) {
+      switch(letter) {
+        case "サ": return "#FF6347"; // トマトレッド
+        case "ク": return "#1E90FF"; // ドッジャーブルー
+        case "セ": return "#32CD32"; // ライムグリーン
+        case "ス": return "#DA70D6"; // オーキッド
+        default:   return "#FFFFFF";
+      }
+    }
+
+    /* ===============================
+       スコア管理とエフェクト
+       =============================== */
+    let eliminationCount = { "サ": 0, "ク": 0, "セ": 0, "ス": 0 };
+    let successMessage = "";
+    function updateScoreBoard() {
+      const scoreBoard = document.getElementById("scoreBoard");
+      scoreBoard.innerHTML =
+        "消去数: " +
+        "<span style='color:" + getBlockColor("サ") + "'>サ:" + eliminationCount["サ"] + "</span> " +
+        "<span style='color:" + getBlockColor("ク") + "'>ク:" + eliminationCount["ク"] + "</span> " +
+        "<span style='color:" + getBlockColor("セ") + "'>セ:" + eliminationCount["セ"] + "</span> " +
+        "<span style='color:" + getBlockColor("ス") + "'>ス:" + eliminationCount["ス"] + "</span>";
+      if(successMessage) {
+        scoreBoard.innerHTML += "<br><span style='font-weight:bold; color:#FFD700;'>" + successMessage + "</span>";
+      }
+    }
+
+    // 簡易ビープ音（エフェクト用）
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    function playBeep() {
+      try {
+        const oscillator = audioCtx.createOscillator();
+        const gainNode = audioCtx.createGain();
+        oscillator.type = "sine";
+        oscillator.frequency.value = 880;
+        oscillator.connect(gainNode);
+        gainNode.connect(audioCtx.destination);
+        oscillator.start();
+        oscillator.stop(audioCtx.currentTime + 0.1);
+      } catch(e) {
+        console.log("Audio error", e);
+      }
+    }
+
+    // 星エフェクト（連鎖消去時の視覚演出）
+    function drawStar(ctx, cx, cy, spikes, outerRadius, innerRadius, color) {
+      let rot = Math.PI / 2 * 3;
+      let step = Math.PI / spikes;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy - outerRadius);
+      for (let i = 0; i < spikes; i++) {
+        let x = cx + Math.cos(rot) * outerRadius;
+        let y = cy + Math.sin(rot) * outerRadius;
+        ctx.lineTo(x, y);
+        rot += step;
+        x = cx + Math.cos(rot) * innerRadius;
+        y = cy + Math.sin(rot) * innerRadius;
+        ctx.lineTo(x, y);
+        rot += step;
+      }
+      ctx.lineTo(cx, cy - outerRadius);
+      ctx.closePath();
+      ctx.fillStyle = color;
+      ctx.fill();
+    }
+
+    /* ===============================
+       ゲームボードの初期化
+       =============================== */
+    let board = [];
+    for(let r = 0; r < ROWS; r++) {
+      board[r] = [];
+      for(let c = 0; c < COLS; c++) {
+        board[r][c] = null;
+      }
+    }
+
+    // フィールド下半分 (ROWS/2 以降) に初期ブロックを配置
+    // 2 or 3 連のグループを並べ、3個以上連続しないよう調整
+    function initBottomHalfClusters() {
+      const startRow = Math.floor(ROWS / 2);
+      for(let r = startRow; r < ROWS; r++) {
+        let c = 0;
+        while(c < COLS) {
+          let remaining = COLS - c;
+          let groupSize = remaining >= 3 ? (Math.random() < 0.5 ? 2 : 3) : remaining;
+          let disallowed = new Set();
+          if(c > 0 && board[r][c-1]) {
+            disallowed.add(board[r][c-1]);
+          }
+          if(r > startRow) {
+            for(let i = 0; i < groupSize; i++) {
+              if(board[r-1][c + i]) {
+                disallowed.add(board[r-1][c + i]);
+              }
+            }
+          }
+          let available = BLOCK_TYPES.filter(t => !disallowed.has(t));
+          if(available.length === 0) available = BLOCK_TYPES;
+          let chosen = available[Math.floor(Math.random() * available.length)];
+          for(let i = 0; i < groupSize; i++) {
+            board[r][c+i] = chosen;
+          }
+          c += groupSize;
+        }
+      }
+    }
+
+    /* ===============================
+       落下中のペアブロックとアニメーション管理
+       =============================== */
+    let fallingPair = null;   // 現在操作中のペア
+    let lastFallTime = 0;
+    let gameOver = false;
+    // 落下アニメ用配列
+    let fallingAnimations = [];
+    // 星エフェクト用配列
+    let starEffects = [];
+
+    // キャンバス
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    // 回転オフセット（0:上,1:右,2:下,3:左）
+    const OFFSETS = [
+      { row: -1, col: 0 },
+      { row: 0, col: 1 },
+      { row: 1, col: 0 },
+      { row: 0, col: -1 }
+    ];
+
+    /* ===============================
+       ペアブロック生成・操作
+       =============================== */
+    function spawnPair() {
+      const startCol = Math.floor(COLS / 2);
+      const mainRow = 1;
+      const mainCol = startCol;
+      const orientation = 2; // 初期は「下」
+      const mainType = BLOCK_TYPES[Math.floor(Math.random() * BLOCK_TYPES.length)];
+      const subType = BLOCK_TYPES[Math.floor(Math.random() * BLOCK_TYPES.length)];
+      fallingPair = {
+        main: { row: mainRow, col: mainCol },
+        orientation,
+        blockMain: mainType,
+        blockSub: subType
+      };
+
+      const subPos = getSubPosition(fallingPair);
+      if(!isInside(fallingPair.main.row, fallingPair.main.col) ||
+         board[fallingPair.main.row][fallingPair.main.col] !== null ||
+         !isInside(subPos.row, subPos.col) ||
+         board[subPos.row][subPos.col] !== null) {
+        gameOver = true;
+      }
+    }
+    function getSubPosition(pair) {
+      const offset = OFFSETS[pair.orientation];
+      return { row: pair.main.row + offset.row, col: pair.main.col + offset.col };
+    }
+    function isInside(r, c) {
+      return r >= 0 && r < ROWS && c >= 0 && c < COLS;
+    }
+    function fixPairToBoard() {
+      const main = fallingPair.main;
+      const sub  = getSubPosition(fallingPair);
+      if(isInside(main.row, main.col)) {
+        board[main.row][main.col] = fallingPair.blockMain;
+      }
+      if(isInside(sub.row, sub.col)) {
+        board[sub.row][sub.col] = fallingPair.blockSub;
+      }
+      fallingPair = null;
+    }
+    function canMove(dr, dc, newOrientation = fallingPair.orientation) {
+      const newMainRow = fallingPair.main.row + dr;
+      const newMainCol = fallingPair.main.col + dc;
+      const offset = OFFSETS[newOrientation];
+      const newSubRow = newMainRow + offset.row;
+      const newSubCol = newMainCol + offset.col;
+      if(!isInside(newMainRow, newMainCol) || board[newMainRow][newMainCol] !== null) return false;
+      if(!isInside(newSubRow, newSubCol) || board[newSubRow][newSubCol] !== null) return false;
+      return true;
+    }
+    function moveDown() {
+      if(canMove(1, 0)) {
+        fallingPair.main.row += 1;
+      } else {
+        fixPairToBoard();
+        // 連鎖消去後に1列だけ下からゴミ行を追加して上昇
+        scheduleEliminations().then((blocksEliminated) => {
+          // blocksEliminated===true のときにだけゴミ行を1列追加
+          if(blocksEliminated) {
+            insertGarbageRow();
+          }
+          spawnPair();
+        });
+      }
+    }
+
+    /* ===============================
+       浮遊ブロック落下アニメーション
+       =============================== */
+    function performFallingAnimations() {
+      for(let c = 0; c < COLS; c++) {
+        let colBlocks = [];
+        for(let r = 0; r < ROWS; r++){
+          if(board[r][c] !== null) {
+            colBlocks.push({ letter: board[r][c], origRow: r });
+          }
+        }
+        let targetRow = ROWS - colBlocks.length;
+        for(let i = 0; i < colBlocks.length; i++) {
+          let block = colBlocks[i];
+          let finalRow = targetRow + i;
+          if(block.origRow !== finalRow) {
+            fallingAnimations.push({
+              letter: block.letter,
+              col: c,
+              startY: block.origRow * BLOCK_SIZE,
+              endY: finalRow * BLOCK_SIZE,
+              currentY: block.origRow * BLOCK_SIZE,
+              startTime: performance.now(),
+              duration: (finalRow - block.origRow) * 150
+            });
+            board[block.origRow][c] = null;
+          }
+        }
+      }
+    }
+    function updateFallingAnimations() {
+      let now = performance.now();
+      for(let i = fallingAnimations.length - 1; i >= 0; i--) {
+        let anim = fallingAnimations[i];
+        let elapsed = now - anim.startTime;
+        let progress = Math.min(elapsed / anim.duration, 1);
+        anim.currentY = anim.startY + (anim.endY - anim.startY) * progress;
+        if(progress >= 1) {
+          let finalRow = anim.endY / BLOCK_SIZE;
+          board[finalRow][anim.col] = anim.letter;
+          fallingAnimations.splice(i, 1);
+        }
+      }
+    }
+
+    /* ===============================
+       ゴミ行を下から1列だけ上昇させる関数
+       =============================== */
+    // ゴミ行：連続が2～3個であり、3個以上連ならない
+    function addGarbageRow() {
+      let newRow = [];
+      let i = 0;
+      while(i < COLS) {
+        let remain = COLS - i;
+        let groupSize = remain >= 3 ? (Math.random() < 0.5 ? 2 : 3) : remain;
+        // 万一groupSizeが1になった場合は再生成
+        if(groupSize === 1) return addGarbageRow();
+        let lastLetter = newRow.length > 0 ? newRow[newRow.length - 1] : null;
+        let available = BLOCK_TYPES.filter(t => t !== lastLetter);
+        let chosen = available[Math.floor(Math.random() * available.length)];
+        for(let j = 0; j < groupSize; j++) {
+          newRow.push(chosen);
+        }
+        i += groupSize;
+      }
+      // 2～3連を満たすかチェック
+      let groups = [];
+      let cur = newRow[0], count = 1;
+      for(let k = 1; k < newRow.length; k++){
+        if(newRow[k] === cur) {
+          count++;
+        } else {
+          groups.push(count);
+          cur = newRow[k];
+          count = 1;
+        }
+      }
+      groups.push(count);
+      for(let size of groups) {
+        if(size < 2 || size > 3) return addGarbageRow();
+      }
+      return newRow;
+    }
+    // 下から1行シフトアップし、新しい行を最下段にセット
+    function insertGarbageRow() {
+      const newRow = addGarbageRow();
+      // 上へ1行ずつシフト
+      for(let r = 0; r < ROWS - 1; r++){
+        board[r] = board[r+1];
+      }
+      board[ROWS - 1] = newRow;
+      // いちばん上にブロックが溢れたらゲームオーバー
+      for(let c = 0; c < COLS; c++){
+        if(board[0][c] !== null) {
+          gameOver = true;
+          break;
+        }
+      }
+    }
+
+    /* ===============================
+       連鎖消去と重力処理
+       =============================== */
+    // 4個以上連結したブロック群を探索
+    function findEliminationGroups() {
+      let groups = [];
+      let visited = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
+      for(let r = 0; r < ROWS; r++){
+        for(let c = 0; c < COLS; c++){
+          if(board[r][c] !== null && !visited[r][c]) {
+            let letter = board[r][c];
+            let cells = [];
+            let stack = [{ r, c }];
+            visited[r][c] = true;
+            while(stack.length > 0) {
+              let cell = stack.pop();
+              cells.push(cell);
+              const dirs = [{dr:-1,dc:0},{dr:1,dc:0},{dr:0,dc:-1},{dr:0,dc:1}];
+              for(let d of dirs) {
+                let nr = cell.r + d.dr, nc = cell.c + d.dc;
+                if(isInside(nr, nc) && !visited[nr][nc] && board[nr][nc] === letter) {
+                  visited[nr][nc] = true;
+                  stack.push({ r: nr, c: nc });
+                }
+              }
+            }
+            if(cells.length >= 4) {
+              groups.push({ letter, cells });
+            }
+          }
+        }
+      }
+      return groups;
+    }
+
+    // 連鎖消去＋特殊連鎖（10個消えたら同じブロック全消去）を再帰的に処理
+    // 返値：ブロックが1つでも消えた場合は true, 消えなかった場合は false
+    function scheduleEliminations() {
+      return new Promise((resolve) => {
+        let anyEliminated = false;
+
+        function checkAndEliminate() {
+          const groups = findEliminationGroups();
+          if(groups.length === 0) {
+            // グループが無い → アニメーションのみ実施
+            performFallingAnimations();
+            let checkInterval = setInterval(() => {
+              if(fallingAnimations.length === 0) {
+                clearInterval(checkInterval);
+
+                // 10個以上消えたブロックの全消去（特殊連鎖）
+                // 連鎖処理ごとにまとめてチェック
+                BLOCK_TYPES.forEach(letter => {
+                  while(eliminationCount[letter] >= 10) {
+                    // 画面上にあるその文字を一掃
+                    for(let rr = 0; rr < ROWS; rr++){
+                      for(let cc = 0; cc < COLS; cc++){
+                        if(board[rr][cc] === letter) {
+                          board[rr][cc] = null;
+                          starEffects.push({
+                            x: cc * BLOCK_SIZE + BLOCK_SIZE/2,
+                            y: rr * BLOCK_SIZE + BLOCK_SIZE/2,
+                            startTime: performance.now(),
+                            duration: 500
+                          });
+                        }
+                      }
+                    }
+                    eliminationCount[letter] -= 10;
+                    successMessage = "サクセス！";
+                    updateScoreBoard();
+                    playBeep();
+                    // 一掃したので浮いているブロックを落下アニメ
+                    performFallingAnimations();
+                    // しばしエフェクトを表示後にメッセージを消去
+                    setTimeout(() => {
+                      successMessage = "";
+                      updateScoreBoard();
+                    }, 2000);
+                  }
+                });
+
+                // ブロックが1つでも消えていれば anyEliminated=true
+                // → この情報を then() に返してゴミ行追加の可否を決定
+                resolve(anyEliminated);
+              }
+            }, 50);
+
+          } else {
+            // グループがある → 連鎖消去実行
+            anyEliminated = true; // 少なくとも何か消える
+            let maxDelay = 0;
+            groups.forEach(group => {
+              playBeep();
+              group.cells.forEach((cell, idx) => {
+                let delay = idx * 100; // 0.1秒ずつずらして消去演出
+                if(delay > maxDelay) maxDelay = delay;
+                setTimeout(() => {
+                  if(board[cell.r][cell.c] !== null) {
+                    board[cell.r][cell.c] = null;
+                    eliminationCount[group.letter]++;
+                    starEffects.push({
+                      x: cell.c * BLOCK_SIZE + BLOCK_SIZE/2,
+                      y: cell.r * BLOCK_SIZE + BLOCK_SIZE/2,
+                      startTime: performance.now(),
+                      duration: 500
+                    });
+                    updateScoreBoard();
+                  }
+                }, delay);
+              });
+            });
+            setTimeout(() => {
+              performFallingAnimations();
+              let checkInterval = setInterval(() => {
+                if(fallingAnimations.length === 0) {
+                  clearInterval(checkInterval);
+                  // さらに消えるものがあるか再チェック（連鎖）
+                  checkAndEliminate();
+                }
+              }, 50);
+            }, maxDelay + 200);
+          }
+        }
+        checkAndEliminate();
+      });
+    }
+
+    /* ===============================
+       描画処理
+       =============================== */
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // ボード背景＆ブロック表示
+      for(let r = 0; r < ROWS; r++){
+        for(let c = 0; c < COLS; c++){
+          ctx.fillStyle = "#333";
+          ctx.fillRect(c*BLOCK_SIZE, r*BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+          ctx.strokeStyle = "#555";
+          ctx.strokeRect(c*BLOCK_SIZE, r*BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+          if(board[r][c] !== null) {
+            ctx.fillStyle = getBlockColor(board[r][c]);
+            ctx.font = "24px Arial";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(board[r][c], c*BLOCK_SIZE+BLOCK_SIZE/2, r*BLOCK_SIZE+BLOCK_SIZE/2);
+          }
+        }
+      }
+
+      // 落下アニメ中ブロック描画
+      fallingAnimations.forEach(anim => {
+        ctx.fillStyle = getBlockColor(anim.letter);
+        ctx.font = "24px Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(anim.letter, anim.col*BLOCK_SIZE+BLOCK_SIZE/2, anim.currentY+BLOCK_SIZE/2);
+      });
+
+      // 落下中ペアブロック描画
+      if(fallingPair !== null) {
+        const main = fallingPair.main;
+        const sub  = getSubPosition(fallingPair);
+
+        // メイン
+        if(isInside(main.row, main.col)) {
+          ctx.fillStyle = getBlockColor(fallingPair.blockMain);
+          ctx.fillText(fallingPair.blockMain,
+            main.col*BLOCK_SIZE+BLOCK_SIZE/2,
+            main.row*BLOCK_SIZE+BLOCK_SIZE/2);
+        }
+
+        // サブ
+        if(isInside(sub.row, sub.col)) {
+          ctx.fillStyle = getBlockColor(fallingPair.blockSub);
+          ctx.fillText(fallingPair.blockSub,
+            sub.col*BLOCK_SIZE+BLOCK_SIZE/2,
+            sub.row*BLOCK_SIZE+BLOCK_SIZE/2);
+        }
+      }
+
+      // 星エフェクト描画
+      const now = performance.now();
+      for(let i = starEffects.length - 1; i >= 0; i--) {
+        let eff = starEffects[i];
+        let elapsed = now - eff.startTime;
+        if(elapsed > eff.duration) {
+          starEffects.splice(i, 1);
+        } else {
+          let alpha = 1 - (elapsed / eff.duration);
+          ctx.save();
+          ctx.globalAlpha = alpha;
+          drawStar(ctx, eff.x, eff.y, 5, 12, 6, "#FFD700");
+          ctx.restore();
+        }
+      }
+
+      // ゲームオーバー表示
+      if(gameOver) {
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = "#FFD700";
+        ctx.font = "32px Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("GAME OVER", canvas.width/2, canvas.height/2);
+      }
+      updateScoreBoard();
+    }
+
+    /* ===============================
+       メインループ
+       =============================== */
+    function gameLoop(timestamp) {
+      if(gameOver) {
+        draw();
+        return;
+      }
+      if(!lastFallTime) {
+        lastFallTime = timestamp;
+      }
+      if(fallingPair !== null && (timestamp - lastFallTime > FALL_INTERVAL)) {
+        moveDown();
+        lastFallTime = timestamp;
+      }
+      updateFallingAnimations();
+      draw();
+      requestAnimationFrame(gameLoop);
+    }
+
+    /* ===============================
+       キーボード操作
+       =============================== */
+    document.addEventListener("keydown", (e) => {
+      if(gameOver || fallingPair === null) return;
+      switch(e.code) {
+        case "ArrowLeft":
+          if(canMove(0, -1)) {
+            fallingPair.main.col -= 1;
+          }
+          break;
+        case "ArrowRight":
+          if(canMove(0, 1)) {
+            fallingPair.main.col += 1;
+          }
+          break;
+        case "ArrowDown":
+          moveDown();
+          break;
+        case "Space":
+          let newOri = (fallingPair.orientation + 1) % 4;
+          if(canMove(0, 0, newOri)) {
+            fallingPair.orientation = newOri;
+          }
+          break;
+      }
+    });
+
+    /* ===============================
+       初期化＆ゲーム開始
+       =============================== */
+    initBottomHalfClusters();
+    spawnPair();
+    updateScoreBoard();
+    requestAnimationFrame(gameLoop);
+
+  </script>
+</body>
+</html>
